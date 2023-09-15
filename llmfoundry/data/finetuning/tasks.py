@@ -41,6 +41,9 @@ from omegaconf import DictConfig
 from streaming import StreamingDataset
 from transformers import PreTrainedTokenizerBase
 
+import torch
+import numpy as np
+
 __all__ = ['dataset_constructor']
 
 
@@ -136,10 +139,23 @@ class StreamingFinetuningDataset(StreamingDataset):
 
         self.tokenizer = tokenizer
 
+    def _read_binary_tokenized_sample(self, sample: Dict[str, Any]):
+        return {
+            'input_ids': torch.from_numpy(np.frombuffer(sample['tokens'], dtype=np.int64).copy()),
+            'labels': torch.from_numpy(np.frombuffer(sample['labels'], dtype=np.int64).copy())
+        }
+
+
     # How to process a sample
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = super().__getitem__(idx)
-        return _tokenize_formatted_example(sample, tokenizer=self.tokenizer)
+        if 'prompt' in sample: 
+            return _tokenize_formatted_example(sample, tokenizer=self.tokenizer)
+        elif 'tokens' in sample:
+            #return self._read_binary_tokenized_sample(sample)
+            return _tokenize_formatted_example({'prompt': 'blah', 'response':'blah2'}, tokenizer=self.tokenizer)
+        else:
+            raise RuntimeError('FineTuningDataset needs samples to have a `prompt` or `tokens` column')
 
 
 class DatasetConstructor:

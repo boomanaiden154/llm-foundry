@@ -779,11 +779,9 @@ class MPTForSequenceClassification(MPTPreTrainedModel):
 
         loss = None
         if labels is not None:
-            _labels = torch.roll(labels, shifts=-1)
-            _labels[:, -1] = -100
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                _labels.to(logits.device).view(-1),
+            loss = F.mse_loss(
+                logits,
+                labels,
             )
 
         return SequenceClassifierOutputWithPast(

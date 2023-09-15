@@ -4,7 +4,8 @@
 from llmfoundry.models.mpt.configuration_mpt import MPTConfig
 from llmfoundry.models.mpt.modeling_mpt import (ComposerMPTCausalLM,
                                                 MPTForCausalLM, MPTModel,
-                                                MPTPreTrainedModel)
+                                                MPTPreTrainedModel,
+                                                ComposerMPTSequenceClassification)
 
 __all__ = [
     'MPTPreTrainedModel',
@@ -12,4 +13,5 @@ __all__ = [
     'MPTForCausalLM',
     'ComposerMPTCausalLM',
     'MPTConfig',
+    'ComposerMPTSequenceClassification'
 ]

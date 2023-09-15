@@ -26,7 +26,8 @@ from omegaconf import DictConfig
 from omegaconf import OmegaConf as om
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast)
+                                           CausalLMOutputWithPast,
+                                           SequenceClassifierOutputWithPast)
 
 from llmfoundry.models.layers.attention import attn_bias_shape, build_attn_bias
 from llmfoundry.models.layers.blocks import MPTBlock
@@ -674,6 +675,205 @@ class MPTForCausalLM(MPTPreTrainedModel):
             ]
         return reordered_past
 
+class MPTForSequenceClassification(MPTPreTrainedModel):
+
+    def __init__(self, config: MPTConfig):
+        super().__init__(config)
+        if not config.tie_word_embeddings:
+            raise ValueError(
+                'MPTForSequenceClassification only supports tied word embeddings')
+
+        log.info(f'Instantiating an MPTForSequenceClassification model from {__file__}')
+
+        self.transformer: MPTModel = MPTModel(config)
+
+        for child in self.transformer.children():
+            if isinstance(child, torch.nn.ModuleList):
+                continue
+            if isinstance(child, torch.nn.Module):
+                child._fsdp_wrap = True
+
+        # enables scaling output logits; similar to a softmax "temperature"
+        # PaLM paper uses scale 1/sqrt(config.d_model)
+        self.logit_scale = None
+        if config.logit_scale is not None:
+            logit_scale = config.logit_scale
+            if isinstance(logit_scale, str):
+                if logit_scale == 'inv_sqrt_d_model':
+                    logit_scale = 1 / math.sqrt(config.d_model)
+                else:
+                    raise ValueError(
+                        f"{logit_scale=} is not recognized as an option; use numeric value or 'inv_sqrt_d_model'."
+                    )
+            self.logit_scale = logit_scale
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.transformer.wte
+
+    def set_input_embeddings(
+            self, value: Union[SharedEmbedding, nn.Embedding]) -> None:
+        self.transformer.wte = value
+
+    def get_output_embeddings(self) -> nn.Embedding:
+        return self.transformer.wte
+
+    def set_output_embeddings(
+            self, new_embeddings: Union[SharedEmbedding, nn.Embedding]) -> None:
+        self.transformer.wte = new_embeddings
+
+    def set_decoder(self, decoder: MPTModel) -> None:
+        self.transformer = decoder
+
+    def get_decoder(self) -> MPTModel:
+        return self.transformer
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[List[Tuple[torch.FloatTensor]]] = None,
+        attention_mask: Optional[torch.ByteTensor] = None,
+        prefix_mask: Optional[torch.ByteTensor] = None,
+        sequence_id: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        return_dict: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ) -> CausalLMOutputWithPast:
+        return_dict = (return_dict
+                       if return_dict is not None else self.config.return_dict)
+        use_cache = (use_cache
+                     if use_cache is not None else self.config.use_cache)
+
+        # if input_embeds is not none, raise a not implemented error
+        if inputs_embeds is not None:
+            raise NotImplementedError(
+                'inputs_embeds has to be None (for hf/peft support).')
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.transformer(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            prefix_mask=prefix_mask,
+            sequence_id=sequence_id,
+            return_dict=return_dict,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            use_cache=use_cache,
+        )
+
+        # move outputs to same device as weights for token embedding
+        # needed to support HF `device_map`
+        logits = self.transformer.wte(
+            outputs.last_hidden_state.to(self.transformer.wte.weight.device),
+            True,
+        )
+
+        if self.logit_scale is not None:
+            if self.logit_scale == 0:
+                warnings.warn(
+                    f'Multiplying logits by {self.logit_scale=}. This will produce uniform (uninformative) outputs.'
+                )
+            logits *= self.logit_scale
+
+        loss = None
+        if labels is not None:
+            _labels = torch.roll(labels, shifts=-1)
+            _labels[:, -1] = -100
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                _labels.to(logits.device).view(-1),
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    # Param Initialization, needed for device='meta' fast initialization
+    def param_init_fn(self, module: nn.Module) -> None:
+        init_fn_name = self.config.init_config['name']
+        MODEL_INIT_REGISTRY[init_fn_name](
+            module=module,
+            n_layers=self.config.n_layers,
+            d_model=self.config.d_model,
+            **self.config.init_config,
+        )
+
+    # FSDP Wrap function
+    def fsdp_wrap_fn(self, module: nn.Module) -> bool:
+        return isinstance(module, MPTBlock)
+
+    # Activation Checkpointing
+    def activation_checkpointing_fn(self, module: nn.Module) -> bool:
+        return isinstance(module, MPTBlock)
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[List[Tuple[torch.Tensor,
+                                             torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if inputs_embeds is not None:
+            raise NotImplementedError(
+                'inputs_embeds is not implemented for MPT yet')
+
+        attention_mask = kwargs['attention_mask'].bool()
+        if attention_mask[:, -1].sum() != attention_mask.shape[0]:
+            raise NotImplementedError(
+                'MPT does not support generation with right padding.')
+
+        if self.transformer.attn_uses_sequence_id and self.training:
+            sequence_id = torch.zeros_like(input_ids[:1])
+        else:
+            sequence_id = None
+
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1].unsqueeze(-1)
+
+        if self.transformer.prefix_lm:
+            # Leverage a convenience of sequential generation!
+            prefix_mask = torch.ones_like(attention_mask)
+            # This requires that we're using the cache
+            if kwargs.get('use_cache') == False:
+                raise NotImplementedError(
+                    'MPT with prefix_lm=True does not support use_cache=False.')
+        else:
+            prefix_mask = None
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'prefix_mask': prefix_mask,
+            'sequence_id': sequence_id,
+            'past_key_values': past_key_values,
+            'use_cache': kwargs.get('use_cache', True),
+        }
+
+    @staticmethod
+    def _reorder_cache(
+            past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+            beam_idx: torch.LongTensor) -> List[Tuple[torch.Tensor, ...]]:
+        """Used by HuggingFace generate when using beam search with kv-caching.
+
+        See https://github.com/huggingface/transformers/blob/3ec7a47664ebe40c40f4b722f6bb1cd30c3821ec/src/transformers/models/gpt2/modeling_gpt2.py#L1122-L1133
+        for an example in transformers.
+        """
+        reordered_past = []
+        for layer_past in past_key_values:
+            reordered_past += [
+                tuple(
+                    past_state.index_select(0, beam_idx)
+                    for past_state in layer_past)
+            ]
+        return reordered_past
+
 
 class ComposerMPTCausalLM(HuggingFaceModel):
 
@@ -683,9 +883,103 @@ class ComposerMPTCausalLM(HuggingFaceModel):
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
     ):
         resolved_om_model_config = om.to_container(om_model_config,
-                                                   resolve=True)
+        resolve=True)
         hf_config = MPTConfig.from_dict(resolved_om_model_config)
         model = MPTForCausalLM(hf_config)
+
+        train_metrics = [LanguageCrossEntropy(), LanguagePerplexity()]
+        eval_metrics = [
+            LanguageCrossEntropy(),
+            LanguagePerplexity(),
+            InContextLearningLMAccuracy(),
+            InContextLearningMultipleChoiceAccuracy(),
+            InContextLearningQAAccuracy(),
+            InContextLearningLMExpectedCalibrationError(),
+            InContextLearningMCExpectedCalibrationError(),
+        ]
+
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            use_logits=True,
+            metrics=train_metrics,
+            eval_metrics=eval_metrics,
+            shift_labels=True,
+            allow_embedding_resizing=True,
+        )
+
+        self.n_active_params = sum(p.numel() for p in self.parameters())
+
+        loss_fn_config = om_model_config.get('loss_fn', 'fused_crossentropy')
+        if loss_fn_config == 'fused_crossentropy':
+            try:
+                from flash_attn.losses.cross_entropy import \
+                    CrossEntropyLoss as FusedCrossEntropyLoss
+
+                self.loss_fn = FusedCrossEntropyLoss(ignore_index=-100)
+            except:
+                raise ValueError(
+                    'Fused Cross Entropy is not installed. Either (1) have a CUDA-compatible GPU '
+                    +
+                    'and `pip install .[gpu]` if installing from source or `pip install xentropy-cuda-lib@git+https://github.com/HazyResearch/flash-attention.git@v1.0.3#subdirectory=csrc/xentropy` '
+                    +
+                    'if installing from pypi, or (2) set your config model.loss_fn=torch_crossentropy.'
+                )
+        elif loss_fn_config == 'torch_crossentropy':
+            self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        else:
+            raise ValueError(
+                f'Specified loss_fn={self.loss_fn} not recognized. `loss_fn` must be one of [`fused_crossentropy`, `torch_crossentropy`].'
+            )
+
+    def get_targets(self, batch: Mapping) -> torch.Tensor:
+        targets = torch.roll(batch['labels'], shifts=-1)
+        targets[:, -1] = -100
+        return targets
+
+    def forward(self, batch: MutableMapping) -> CausalLMOutputWithPast:
+        if self.model.transformer.prefix_lm:
+            add_bidirectional_mask_if_missing(batch)
+        # Note: prefix_mask is only used if model.prefix_lm is True
+        return self.model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch.get('attention_mask', None),
+            prefix_mask=batch.get('bidirectional_mask', None),
+            sequence_id=batch.get('sequence_id', None),
+            inputs_embeds=batch.get('inputs_embeds', None),
+        )
+
+    def loss(self, outputs: CausalLMOutputWithPast,
+             batch: Mapping) -> torch.Tensor:
+        targets = self.get_targets(batch)
+        return self.loss_fn(outputs.logits.view(-1, outputs.logits.size(-1)),
+                            targets.view(-1))
+
+    def flops_per_batch(self, batch: Mapping) -> int:
+        # Note: this computation does not take into account padding, and assumes
+        # that the dataset has been constructed without padding. Additionally, we
+        # assume the backward pass is approximately 2x the forward pass
+
+        bs, msl = batch['input_ids'].shape[0:2]
+        params_flops_per_token = 2 * self.n_active_params
+        params_flops_per_seq = params_flops_per_token * msl
+        attn_flops_per_seq = (self.model.config.n_layers * 2 * 2 *
+                              (self.model.config.d_model * (msl**2)))
+
+        return (params_flops_per_seq + attn_flops_per_seq) * 3 * bs
+
+
+class ComposerMPTSequenceClassification(HuggingFaceModel):
+
+    def __init__(
+        self,
+        om_model_config: DictConfig,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    ):
+        resolved_om_model_config = om.to_container(om_model_config,
+        resolve=True)
+        hf_config = MPTConfig.from_dict(resolved_om_model_config)
+        model = MPTForSequenceClassification(hf_config)
 
         train_metrics = [LanguageCrossEntropy(), LanguagePerplexity()]
         eval_metrics = [

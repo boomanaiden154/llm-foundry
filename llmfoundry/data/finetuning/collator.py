@@ -133,6 +133,8 @@ class Seq2SeqFinetuningCollator:
         for example in examples:
             context = ensure_list(example['input_ids'])
             target = ensure_list(example['labels'])
+
+            raise ValueError(context.dtype)
             # First, get rid of any padding tokens
             context = [t for t in context if t != self.tokenizer.pad_token_id]
             target = [t for t in target if t != self.tokenizer.pad_token_id]

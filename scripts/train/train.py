@@ -556,6 +556,7 @@ def main(cfg: DictConfig) -> Trainer:
         autoresume=autoresume,
         python_log_level=python_log_level,
         dist_timeout=dist_timeout,
+        load_strict_model_weights=False
     )
 
     print('Logging config')

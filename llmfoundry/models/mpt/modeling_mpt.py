@@ -18,7 +18,8 @@ from composer.metrics import (InContextLearningLMAccuracy,
                               InContextLearningLMExpectedCalibrationError,
                               InContextLearningMCExpectedCalibrationError,
                               InContextLearningMultipleChoiceAccuracy,
-                              InContextLearningQAAccuracy)
+                              InContextLearningQAAccuracy,
+                              LossMetric)
 from composer.metrics.nlp import LanguageCrossEntropy, LanguagePerplexity
 from composer.models import HuggingFaceModel
 from composer.utils import dist
@@ -707,6 +708,8 @@ class MPTForSequenceClassification(MPTPreTrainedModel):
                     )
             self.logit_scale = logit_scale
 
+        self.score = nn.Linear(768, 1, bias=False)
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.transformer.wte
 
@@ -763,30 +766,17 @@ class MPTForSequenceClassification(MPTPreTrainedModel):
             use_cache=use_cache,
         )
 
-        # move outputs to same device as weights for token embedding
-        # needed to support HF `device_map`
-        logits = self.transformer.wte(
-            outputs.last_hidden_state.to(self.transformer.wte.weight.device),
-            True,
-        )
+        hidden_states = outputs[0]
+        logits = self.score(hidden_states)
 
-        if self.logit_scale is not None:
-            if self.logit_scale == 0:
-                warnings.warn(
-                    f'Multiplying logits by {self.logit_scale=}. This will produce uniform (uninformative) outputs.'
-                )
-            logits *= self.logit_scale
+        batch_size = input_ids.shape[0]
+        sequence_length = -1
 
-        loss = None
-        if labels is not None:
-            loss = F.mse_loss(
-                logits,
-                labels,
-            )
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_length]
 
         return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=logits,
+            loss=None,
+            logits=pooled_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -979,16 +969,8 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
         hf_config = MPTConfig.from_dict(resolved_om_model_config)
         model = MPTForSequenceClassification(hf_config)
 
-        train_metrics = [LanguageCrossEntropy(), LanguagePerplexity()]
-        eval_metrics = [
-            LanguageCrossEntropy(),
-            LanguagePerplexity(),
-            InContextLearningLMAccuracy(),
-            InContextLearningMultipleChoiceAccuracy(),
-            InContextLearningQAAccuracy(),
-            InContextLearningLMExpectedCalibrationError(),
-            InContextLearningMCExpectedCalibrationError(),
-        ]
+        train_metrics = [LossMetric(nn.MSELoss())]
+        eval_metrics = [LossMetric(nn.MSELoss())]
 
         super().__init__(
             model=model,
@@ -1001,33 +983,7 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
         )
 
         self.n_active_params = sum(p.numel() for p in self.parameters())
-
-        loss_fn_config = om_model_config.get('loss_fn', 'fused_crossentropy')
-        if loss_fn_config == 'fused_crossentropy':
-            try:
-                from flash_attn.losses.cross_entropy import \
-                    CrossEntropyLoss as FusedCrossEntropyLoss
-
-                self.loss_fn = FusedCrossEntropyLoss(ignore_index=-100)
-            except:
-                raise ValueError(
-                    'Fused Cross Entropy is not installed. Either (1) have a CUDA-compatible GPU '
-                    +
-                    'and `pip install .[gpu]` if installing from source or `pip install xentropy-cuda-lib@git+https://github.com/HazyResearch/flash-attention.git@v1.0.3#subdirectory=csrc/xentropy` '
-                    +
-                    'if installing from pypi, or (2) set your config model.loss_fn=torch_crossentropy.'
-                )
-        elif loss_fn_config == 'torch_crossentropy':
-            self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-        else:
-            raise ValueError(
-                f'Specified loss_fn={self.loss_fn} not recognized. `loss_fn` must be one of [`fused_crossentropy`, `torch_crossentropy`].'
-            )
-
-    def get_targets(self, batch: Mapping) -> torch.Tensor:
-        targets = torch.roll(batch['labels'], shifts=-1)
-        targets[:, -1] = -100
-        return targets
+        self.loss_fn = nn.MSELoss()
 
     def forward(self, batch: MutableMapping) -> CausalLMOutputWithPast:
         if self.model.transformer.prefix_lm:
@@ -1043,9 +999,7 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
 
     def loss(self, outputs: CausalLMOutputWithPast,
              batch: Mapping) -> torch.Tensor:
-        targets = self.get_targets(batch)
-        return self.loss_fn(outputs.logits.view(-1, outputs.logits.size(-1)),
-                            targets.view(-1))
+        return self.loss_fn(outputs.logits.squeeze(), batch['labels'].squeeze())
 
     def flops_per_batch(self, batch: Mapping) -> int:
         # Note: this computation does not take into account padding, and assumes

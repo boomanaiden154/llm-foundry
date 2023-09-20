@@ -980,6 +980,21 @@ class MSELossMetric(Metric):
         assert isinstance(self.sum_loss, torch.Tensor)
         return self.sum_loss / self.total_batches
 
+class AverageBytesDifference(Metric):
+    full_state_update = False
+
+    def __init__(self, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.add_state('sum_difference', default=torch.tensor(0.), dist_reduce_fx='sum')
+        self.add_state('total_batches', default=torch.tensor(0), dist_reduce_fx='sum')
+
+    def update(self, preds, targets):
+        self.sum_difference += torch.mean(torch.abs(torch.exp(preds.squeeze() * 10) - torch.exp(targets.squeeze() * 10)))
+        self.total_batches += 1
+
+    def compute(self):
+        return self.sum_difference / self.total_batches
+
 class ComposerMPTSequenceClassification(HuggingFaceModel):
 
     def __init__(
@@ -992,8 +1007,8 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
         hf_config = MPTConfig.from_dict(resolved_om_model_config)
         model = MPTForSequenceClassification(hf_config)
 
-        train_metrics = [MSELossMetric()]
-        eval_metrics = [MSELossMetric()]
+        train_metrics = [MSELossMetric(), AverageBytesDifference()]
+        eval_metrics = [MSELossMetric(), AverageBytesDifference()]
 
         super().__init__(
             model=model,

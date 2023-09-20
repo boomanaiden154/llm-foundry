@@ -72,7 +72,7 @@ def _tokenize_formatted_example(
 def _read_binary_tokenized_sample(sample: Dict[str, Any]):
     example = {
         'input_ids': torch.from_numpy(np.frombuffer(sample['tokens'], dtype=np.int64).copy()),
-        'labels': torch.from_numpy(np.frombuffer(sample['labels'], dtype='f').copy()),
+        'labels': torch.from_numpy(np.frombuffer(sample['labels'], dtype=np.double).copy()),
     }
     example['attention_mask'] = torch.ones(example['input_ids'].size(), dtype=torch.int64)
     return example

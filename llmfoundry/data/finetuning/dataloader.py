@@ -10,7 +10,7 @@ from composer.utils import dist, get_file, parse_uri
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
-from transformers import DataCollatorForLanguageModeling, DataCollatorForTokenClassification, DefaultDataCollator
+from transformers import DataCollatorForLanguageModeling, DataCollatorForTokenClassification, DefaultDataCollator, DataCollatorWithPadding
 
 from llmfoundry.data.finetuning.collator import Seq2SeqFinetuningCollator
 from llmfoundry.data.finetuning.tasks import dataset_constructor
@@ -132,7 +132,7 @@ def build_finetuning_dataloader(cfg: DictConfig,
             shuffle=cfg.dataset.get('shuffle', False),
             shuffle_seed=cfg.dataset.get('shuffle_seed', 9176),
         )
-        collate_fn = DefaultDataCollator()
+        collate_fn = DataCollatorWithPadding(tokenizer)
 
         return DataLoader(
             dataset,

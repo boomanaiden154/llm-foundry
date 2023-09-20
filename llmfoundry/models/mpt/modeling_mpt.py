@@ -20,6 +20,7 @@ from composer.metrics import (InContextLearningLMAccuracy,
                               InContextLearningMultipleChoiceAccuracy,
                               InContextLearningQAAccuracy,
                               LossMetric)
+from torchmetrics import Metric
 from composer.metrics.nlp import LanguageCrossEntropy, LanguagePerplexity
 from composer.models import HuggingFaceModel
 from composer.utils import dist
@@ -957,6 +958,28 @@ class ComposerMPTCausalLM(HuggingFaceModel):
         return (params_flops_per_seq + attn_flops_per_seq) * 3 * bs
 
 
+class MSELossMetric(Metric):
+    full_state_update = False
+
+    def __init__(self, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.loss_function = nn.MSELoss()
+        self.add_state('sum_loss', default=torch.tensor(0.), dist_reduce_fx='sum')
+        self.add_state('total_batches', default=torch.tensor(0), dist_reduce_fx='sum')
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
+        """Update the state with new predictions and targets."""
+        # Loss calculated over samples/batch, accumulate loss over all batches
+        self.sum_loss += self.loss_function(preds.squeeze(), targets.squeeze())
+        self.total_batches += 1  # type: ignore
+
+    def compute(self):
+        """Aggregate state over all processes and compute the metric."""
+        # Return average loss over entire validation dataset
+        assert isinstance(self.total_batches, torch.Tensor)
+        assert isinstance(self.sum_loss, torch.Tensor)
+        return self.sum_loss / self.total_batches
+
 class ComposerMPTSequenceClassification(HuggingFaceModel):
 
     def __init__(
@@ -969,8 +992,8 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
         hf_config = MPTConfig.from_dict(resolved_om_model_config)
         model = MPTForSequenceClassification(hf_config)
 
-        train_metrics = [LossMetric(nn.MSELoss())]
-        eval_metrics = [LossMetric(nn.MSELoss())]
+        train_metrics = [MSELossMetric()]
+        eval_metrics = [MSELossMetric()]
 
         super().__init__(
             model=model,
@@ -978,7 +1001,7 @@ class ComposerMPTSequenceClassification(HuggingFaceModel):
             use_logits=True,
             metrics=train_metrics,
             eval_metrics=eval_metrics,
-            shift_labels=True,
+            shift_labels=False,
             allow_embedding_resizing=True,
         )
 

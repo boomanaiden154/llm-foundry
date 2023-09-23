@@ -771,9 +771,9 @@ class MPTForSequenceClassification(MPTPreTrainedModel):
         logits = self.score(hidden_states)
 
         batch_size = input_ids.shape[0]
-        sequence_length = -1
+        sequence_lengths = (torch.ne(input_ids, 0).sum(-1) - 1).to(logits.device)
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_length]
+        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
 
         return SequenceClassifierOutputWithPast(
             loss=None,

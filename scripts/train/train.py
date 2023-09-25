@@ -178,6 +178,7 @@ def build_dataloader(cfg: DictConfig, tokenizer: PreTrainedTokenizerBase,
 
 
 def main(cfg: DictConfig) -> Trainer:
+    os.sched_setaffinity(0, set(range(0,128)))
     # Filter deprecation warning from torch internal usage
     warnings.filterwarnings(
         action='ignore',

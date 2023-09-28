@@ -709,7 +709,7 @@ class MPTForSequenceClassification(MPTPreTrainedModel):
                     )
             self.logit_scale = logit_scale
 
-        self.score = nn.Linear(768, 1, bias=False)
+        self.score = nn.Linear(config.d_model, 1, bias=False)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.transformer.wte
